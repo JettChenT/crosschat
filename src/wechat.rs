@@ -11,7 +11,7 @@ pub struct ChatLogResponse {
     pub chat_logs: Vec<ChatLogItem>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Hash, Eq, PartialEq, Clone)]
 pub struct ChatLogItem {
     #[serde(rename = "fromUser")]
     pub from_user: String,

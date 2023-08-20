@@ -1,20 +1,23 @@
+mod tests;
 mod util;
 mod wechat;
 
 use color_eyre::eyre::Result;
 use futures::prelude::*;
 use irc::client::prelude::*;
+use std::time::Duration;
 
-use crate::wechat::{fetch_chatlog, send_msg};
+use crate::wechat::{ChatLogItem, fetch_chatlog, send_msg};
 
 use crate::util::get_timestamp;
 use console::Term;
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 use irc::client::ClientStream;
-use std::thread;
-use std::time;
+
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+use std::collections::HashSet;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,11 +50,11 @@ async fn main() -> Result<()> {
                 });
                 threads.push(t);
             }
-            None => {break;}
+            None => {
+                break;
+            }
         }
     }
-
-
 
     for join_handle in threads {
         join_handle.await?;
@@ -70,8 +73,9 @@ async fn spawn_client(
     target_username: String,
 ) -> Result<()> {
     let config = Config {
-        nickname: Some(nickname),
+        nickname: Some(nickname.clone()),
         server: Some("127.0.0.1".to_owned()),
+        channels: vec!["#spam".to_owned()],
         use_tls: Some(false),
         ..Config::default()
     };
@@ -80,50 +84,80 @@ async fn spawn_client(
     let (itx, mut irx): (Sender<SendMsg>, Receiver<SendMsg>) = mpsc::channel(32);
     let mut client = Client::from_config(config).await?;
     client.identify()?;
-    let stream = client.stream()?;
+    let mut stream = client.stream()?;
     let tuser = target_username.clone();
-    eprintln!("preparing to spawn for receiver...");
-    let _irc_watch = tokio::spawn(async move {
-        spawn_receiver(stream, tuser, itx).await;
-    });
+    let itx_cp = itx.clone();
 
     let tuser = target_username.clone();
     let tcontact = target_contact_id.clone();
-    eprintln!("preparing to spawn for watcher...");
+    let tx_clone = tx.clone();
     let _wechat_watch = tokio::spawn(async move {
-        spawn_watcher(tcontact, tuser, tx).await;
+        spawn_watcher(tcontact, tuser, tx_clone).await;
     });
 
     let reqw_client = reqwest::Client::new();
+    let mut interval = tokio::time::interval(Duration::from_millis(1000));
+    let mut cnt = 0;
 
     loop {
-        // println!("looping");
-        if let Ok(msg) = irx.try_recv() {
-            println!("sending {} to {} in wechat", msg.msg, msg.channel);
-            send_msg(
-                target_contact_id.clone(),
-                msg.msg,
-                Some(reqw_client.clone()),
-            )
-            .await?;
-        }
+        tokio::select! {
+            Some(msg) = rx.recv() =>{
+                println!("sending {} to {} in irc", msg.msg, msg.channel);
+                client.send_privmsg(&target_username, &msg.msg)?;
+            }
 
-        if let Ok(msg) = rx.try_recv() {
-            println!("sending {} to {} in irc", msg.msg, msg.channel);
-            client.send_privmsg(&msg.channel, &msg.msg).unwrap();
-        }
+            Some(msg) = irx.recv() => {
+                println!("sending {} to {} in wechat", msg.msg, msg.channel);
+                send_msg(
+                    target_contact_id.clone(),
+                    msg.msg,
+                    Some(reqw_client.clone()),
+                ).await?;
+            }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            Some(message) = stream.next() => {
+                let message: Message = message?;
+                // println!("received: {}", &message);
+                if let Command::PRIVMSG(channel, msg) = message.clone().command {
+                    let from = message.source_nickname().unwrap();
+                    println!("{} <=> {}", from, target_username);
+                    if from == target_username {
+                        itx_cp.send(SendMsg { channel, msg }).await?;
+                    }
+                }
+            }
+
+            _ = interval.tick() => {
+                cnt+=1;
+                if cnt<5{
+                    tx.send(
+                        SendMsg {
+                            channel: target_username.clone(),
+                            msg: "preparing...".to_string()
+                        }
+                    ).await?;
+                }
+                if cnt==5{
+                    tx.send(
+                        SendMsg {
+                            channel: target_username.clone(),
+                            msg: format!("Hello! I am the wechat proxy bot for {}", nickname)
+                        }
+                    ).await?;
+                }
+            }
+        }
     }
 }
 
 async fn spawn_receiver(
-    mut stream: ClientStream,
+    stream: &mut ClientStream,
     watch_sender: String,
     irc_sender: Sender<SendMsg>,
-    ) -> Result<()> {
+) -> Result<()> {
     eprintln!("spawn_receiver");
-    while let Some(message) = stream.next().await.transpose()? {
+    if let Some(message) = stream.next().await.transpose()? {
+        println!("received: {}", &message);
         if let Command::PRIVMSG(channel, msg) = message.clone().command {
             let from = message.source_nickname().unwrap();
             println!("{} <=> {}", from, watch_sender);
@@ -146,18 +180,16 @@ async fn spawn_watcher(
     sender
         .send(SendMsg {
             channel: target_channel.clone(),
-            msg: format!(
-                "=== Initializing Wechat Link with {} ===",
-                watch_wxid.clone()
-            ),
+            msg: format!("Hello! I am wechat BOT"),
         })
         .await?;
+    let mut existing_msg: HashSet<ChatLogItem> = HashSet::new();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         let chat_logs =
             fetch_chatlog(watch_wxid.clone(), Some(5), Some(req_client.clone())).await?;
         for log in chat_logs.chat_logs {
-            if !log.is_sent_from_self && log.create_time >= last_timestamp {
+            if !log.is_sent_from_self && !existing_msg.contains(&log) {
                 println!("{}: {}", log.create_time, log.content);
                 let msg = log.content.to_string();
                 sender
@@ -166,7 +198,7 @@ async fn spawn_watcher(
                         msg,
                     })
                     .await?;
-                println!("sent");
+                existing_msg.insert(log);
             }
         }
         last_timestamp = get_timestamp();
